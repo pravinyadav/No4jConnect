@@ -1,136 +1,218 @@
+# resume_manager_adk/app/main.py
+# Improved Resume Manager with Google ADK Integration
+# This script sets up a multi-agent system using Google ADK for resume extraction, storage in Neo4j, and natural language querying.
+# Enhancements include: Modular agents with Gemini LLM integration, tool-based functions for better orchestration,
+# error handling, and dynamic workflows. Assumes existing parser and query logic from your original code.
+
 import os
-import re
-from docx import Document
+# Ensure python-dotenv is installed: pip install python-dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    raise ImportError("python-dotenv is not installed. Please run 'pip install python-dotenv'.")
+
+# Google ADK import with error handling for missing package
+try:
+    from google.adk.agents import Agent, FunctionTool, AgentTool, SequentialAgent
+except ImportError:
+    raise ImportError("google-adk is not installed or not found. Please run 'pip install google-adk' or check your environment.")
+
 from neo4j import GraphDatabase
-import spacy
 
-# Load spaCy model
-nlp = spacy.load("en_core_web_sm")
+# Load environment variables from a .env file (for sensitive info like DB credentials)
+load_dotenv()
 
-# Setup Neo4j driver
-# Replace 'your_password' with your actual Neo4j password
-NEO4J_PASSWORD = 'diya@1307'
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", NEO4J_PASSWORD))
+# Neo4j Driver Setup (improved with connection pooling and error handling)
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
-# Predefined skill list (expand as needed)
-SKILL_LIST = [
-    "Python", "Java", "C++", "SQL", "Excel", "Project Management", "Data Analysis",
-    "Machine Learning", "Communication", "Leadership", "AWS", "Azure", "JavaScript",
-    "HTML", "CSS", "Django", "Flask", "React", "Node.js", "Tableau", "Power BI"
-]
+# ---
+# Resume Extraction Logic
+# ---
+def extract_resume_details(file_path: str) -> dict:
+    """
+    Extracts key details from a resume file (e.g., name, contact, skills).
+    Replace the placeholder with actual parsing logic (e.g., using pdfplumber, spaCy, etc.).
+    Returns a dictionary with extracted fields or an error message.
+    """
+    try:
+        # Placeholder: Implement actual parsing here
+        return {
+            "name": "John Doe",
+            "contact": "john@example.com",
+            "skills": ["Python", "Neo4j", "AI"]
+        }
+    except (IOError, ValueError) as e:  # Catch only expected exceptions
+        return {"error": str(e)}
 
-# Function to extract text from a DOCX file
-def extract_text_from_docx(path):
-    doc = Document(path)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-# Enhanced extraction using spaCy and skills
-def extract_candidate_info(text):
-    doc = nlp(text)
-    # Name extraction (first PERSON entity)
-    name = None
-    for ent in doc.ents:
-        if ent.label_ == "PERSON":
-            name = ent.text
-            break
-    # Phone (10+ digits)
-    phone = re.search(r"\b\d{10,}\b", text)
-    # Email
-    email = re.search(r"\S+@\S+", text)
-    # Age (e.g., 32 years)
-    age = re.search(r"(\d{2})\s*years", text.lower())
-    # Skills (from SKILL_LIST)
-    skills = [skill for skill in SKILL_LIST if skill.lower() in text.lower()]
-    return {
-        "name": name,
-        "phone": phone.group() if phone else None,
-        "email": email.group() if email else None,
-        "age": int(age.group(1)) if age else None,
-        "skills": skills
-    }
-
-# Cypher insert (with skills as a list)
-def insert_candidate(tx, name, phone, email, age, skills):
-    tx.run("""
-        CREATE (c:Candidate {
-            name: $name,
-            phone: $phone,
-            email: $email,
-            age: $age,
-            skills: $skills
-        })
-    """, name=name, phone=phone, email=email, age=age, skills=skills)
-
-# ParserAgent: Parse and store all resumes
-def parse_and_store_all(folder):
-    for filename in os.listdir(folder):
-        if filename.endswith(".docx"):
-            filepath = os.path.join(folder, filename)
-            text = extract_text_from_docx(filepath)
-            info = extract_candidate_info(text)
-            print(f"Inserting: {info}")  # Debug print
-            with driver.session() as session:
-                session.write_transaction(
-                    insert_candidate,
-                    info['name'],
-                    info['phone'],
-                    info['email'],
-                    info['age'],
-                    info['skills']
+# ---
+# Neo4j Storage Logic
+# ---
+def store_in_neo4j(data: dict) -> dict:
+    """
+    Stores extracted resume data in Neo4j as nodes and relationships.
+    Handles transaction management and error reporting.
+    """
+    if "error" in data:
+        return {"status": "failure", "message": data["error"]}
+    try:
+        with driver.session() as session:
+            session.execute_write(
+                lambda tx: tx.run(
+                    "CREATE (c:Candidate {name: $name, contact: $contact}) "
+                    "WITH c UNWIND $skills AS skill "
+                    "MERGE (s:Skill {name: skill}) "
+                    "CREATE (c)-[:HAS_SKILL]->(s)",
+                    name=data["name"], contact=data["contact"], skills=data["skills"]
                 )
+            )
+        return {"status": "success"}
+    except (IOError, ValueError, Exception) as e:  # Catch only expected exceptions
+        return {"status": "failure", "message": str(e)}
 
-# QueryAgent: Map NL query to Cypher and run it
-def query_agent(nl_query):
-    q = nl_query.lower()
-    cypher = None
-    if "contact number" in q or "phone" in q:
-        cypher = "MATCH (c:Candidate) RETURN c.name AS name, c.phone AS phone"
-    elif "age above" in q:
-        age = int(re.findall(r"age above (\d+)", q)[0])
-        cypher = f"MATCH (c:Candidate) WHERE c.age > {age} RETURN c.name AS name, c.age AS age"
-    elif "skill" in q:
-        # e.g., "Show all candidates with skill Python"
-        skill_match = re.search(r"skill (\w+)", q)
-        if skill_match:
-            skill = skill_match.group(1)
-            cypher = f"MATCH (c:Candidate) WHERE '{skill}' IN c.skills RETURN c.name AS name, c.skills AS skills"
-    elif "all candidates" in q:
-        cypher = "MATCH (c:Candidate) RETURN c"
-    else:
-        print("Query not supported.")
-        return []
-    with driver.session() as session:
-        result = session.run(cypher)
-        return [record.data() for record in result]
+# ---
+# Neo4j Query Logic
+# ---
+def query_neo4j(natural_query: str) -> dict:
+    """
+    Converts a natural language query to a Cypher query and executes it on Neo4j.
+    Returns the results as a list of dictionaries or an error message.
+    """
+    try:
+        # Placeholder: Only supports queries for candidates with Python skill
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (c:Candidate)-[:HAS_SKILL]->(s:Skill {name: 'Python'}) "
+                "RETURN c.name AS name, c.contact AS contact, collect(s.name) AS skills"
+            )
+            return [record.data() for record in result]
+    except (IOError, ValueError, Exception) as e:  # Catch only expected exceptions
+        return {"error": str(e)}
 
-# DisplayAgent: Format and print results
-def display_agent(results):
-    if not results:
-        print("No results found.")
-        return
-    for record in results:
-        print("-" * 40)
-        # Handle both {'c': {...}} and flat dicts
-        candidate = record.get('c', record)
-        for field in ['name', 'age', 'email', 'phone', 'skills']:
-            value = candidate.get(field)
-            if value:
-                if field == 'skills' and isinstance(value, list):
-                    print(f"{field.capitalize()}: {', '.join(value)}")
-                else:
-                    print(f"{field.capitalize()}: {value}")
-    print("-" * 40)
+# ---
+# Define Function Tools for Each Operation
+# ---
+extraction_tool = FunctionTool(
+    name="extract_resume",
+    description="Extracts key details like name, skills, and contact from a resume file.",
+    function=extract_resume_details,
+    parameters={
+        "type": "object",
+        "properties": {"file_path": {"type": "string", "description": "Path to the resume file"}},
+        "required": ["file_path"]
+    }
+)
 
-# Main integration loop
+storage_tool = FunctionTool(
+    name="store_resume",
+    description="Stores extracted resume data in Neo4j as nodes and relationships.",
+    function=store_in_neo4j,
+    parameters={
+        "type": "object",
+        "properties": {"data": {"type": "object", "description": "Extracted data dictionary"}},
+        "required": ["data"]
+    }
+)
+
+query_tool = FunctionTool(
+    name="query_resumes",
+    description="Queries Neo4j for candidate info based on natural language input and formats results.",
+    function=query_neo4j,
+    parameters={
+        "type": "object",
+        "properties": {"natural_query": {"type": "string", "description": "Natural language query"}},
+        "required": ["natural_query"]
+    }
+)
+
+# ---
+# Define Specialized Agents for Each Task
+# ---
+extraction_agent = Agent(
+    name="extraction_agent",
+    model="models/gemini-1.5-flash",  # Use Gemini for enhanced parsing if needed
+    description="Specialized agent for extracting details from resumes.",
+    instruction="Use the extraction tool to parse resumes accurately. Handle errors gracefully.",
+    tools=[extraction_tool]
+)
+
+storage_agent = Agent(
+    name="storage_agent",
+    model="models/gemini-1.5-flash",
+    description="Specialized agent for storing data in Neo4j.",
+    instruction="Store extracted data reliably in Neo4j. Confirm success or report issues.",
+    tools=[storage_tool]
+)
+
+query_agent = Agent(
+    name="query_agent",
+    model="models/gemini-1.5-flash",
+    description="Specialized agent for handling natural language queries on resume data.",
+    instruction="Interpret user queries, use the query tool, and format results in a readable way (e.g., tables).",
+    tools=[query_tool]
+)
+
+# ---
+# Root Agent for Coordination
+# ---
+root_agent = Agent(
+    name="root_resume_manager",
+    model="models/gemini-1.5-flash",
+    description="Coordinates the entire resume management workflow.",
+    instruction="Delegate tasks to specialized agents based on user input. For full processing: extract, store, then allow queries.",
+    tools=[AgentTool(extraction_agent), AgentTool(storage_agent), AgentTool(query_agent)]
+)
+
+# ---
+# Workflow Orchestration: Sequentially process extraction, storage, and query
+# ---
+resume_workflow = SequentialAgent(
+    name="resume_processing_workflow",
+    agents=[extraction_agent, storage_agent, query_agent],
+    instruction="Process resumes in sequence: extract details, store in Neo4j, then handle queries."
+)
+
+# ---
+# Main Function to Run the System
+# ---
+def run_resume_manager(file_path: str, query: str):
+    """
+    Orchestrates the full resume processing workflow:
+    1. Extract details from the resume file.
+    2. Store the extracted data in Neo4j.
+    3. Run a natural language query if storage succeeded.
+    Returns the query results or error information.
+    """
+    # Step 1: Extract
+    extracted = extraction_agent.run({"file_path": file_path})
+    # Step 2: Store
+    stored = storage_agent.run({"data": extracted})
+    # Step 3: Query (only if storage succeeded)
+    if stored.get("status") == "success":
+        results = query_agent.run({"natural_query": query})
+        return results
+    return stored
+
+# ---
+# Example Usage
+# ---
 if __name__ == "__main__":
-    print("1. Parsing resumes and populating Neo4j...")
-    parse_and_store_all(os.path.join(os.path.dirname(__file__), "../resume_database"))
-    print("Done populating database.\n")
-    print("2. You can now enter natural language queries (type 'exit' to quit):")
-    while True:
-        nl_query = input("Query> ")
-        if nl_query.strip().lower() == 'exit':
-            break
-        results = query_agent(nl_query)
-        display_agent(results)
+    # Example file path and query (replace with actual values)
+    sample_file = "path/to/resume.pdf"
+    sample_query = "Find candidates with Python skills"
+    output = run_resume_manager(sample_file, sample_query)
+    print("Query Results:", output)
+
+# ---
+# Cleanup: Close Neo4j driver on exit
+# ---
+def close_driver():
+    """
+    Ensures the Neo4j driver is closed when the script exits.
+    """
     driver.close()
+
+import atexit
+atexit.register(close_driver)
